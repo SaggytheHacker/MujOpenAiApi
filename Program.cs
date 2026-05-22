@@ -273,11 +273,24 @@ app.MapPost("/api/chat", async (
     chat.UpdatedAtUtc = now;
     await dbContext.SaveChangesAsync(cancellationToken);
 
-    // Payload pro OpenAI Responses API. Vstupem je primo prompt od uzivatele.
+    // Nacteni poslednich zprav z aktualniho chatu pro kontext modelu.
+    // Model sam o sobe stav nedrzi, proto mu historii posilame z databaze pri kazdem requestu.
+    var historyMessageLimit = configuration.GetValue("OpenAI:HistoryMessageLimit", 20);
+    var chatHistory = await dbContext.ChatMessages
+        .AsNoTracking()
+        .Where(message => message.ChatId == chat.Id)
+        .OrderByDescending(message => message.CreatedAtUtc)
+        .Take(historyMessageLimit)
+        .OrderBy(message => message.CreatedAtUtc)
+        .Select(message => new OpenAiInputMessage(message.Role, message.Content))
+        .ToListAsync(cancellationToken);
+
+    // Payload pro OpenAI Responses API. Vstupem je historie chatu, ne jen posledni prompt.
     var payload = new
     {
         model,
-        input = request.Message
+        instructions = "Odpovidej jako uzitecny asistent. Ber v potaz celou historii konverzace v inputu.",
+        input = chatHistory
     };
 
     // Sestaveni HTTP requestu vcetne autorizace pres Bearer token.
@@ -382,3 +395,8 @@ public sealed record ChatRequest(
 public sealed record ChatResponse(
     [property: JsonPropertyName("chatId")] Guid ChatId,
     [property: JsonPropertyName("answer")] string Answer);
+
+// Datovy model jedne zpravy posilane do OpenAI jako historie konverzace.
+public sealed record OpenAiInputMessage(
+    [property: JsonPropertyName("role")] string Role,
+    [property: JsonPropertyName("content")] string Content);
