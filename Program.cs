@@ -3,6 +3,9 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.EntityFrameworkCore;
+using MujOpenAiApi.Data;
+using MujOpenAiApi.Models;
 
 // HTML, CSS a JavaScript pro jednoduchy frontend.
 // Stranka obsahuje chatovaci okno, textarea pro prompt a tlacitko pro odeslani.
@@ -126,6 +129,7 @@ const string IndexHtml = """
     const input = document.getElementById('message');
     const messages = document.getElementById('messages');
     const send = document.getElementById('send');
+    let currentChatId = null;
 
     function addMessage(text, cssClass) {
       const element = document.createElement('div');
@@ -149,10 +153,14 @@ const string IndexHtml = """
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text })
+          body: JSON.stringify({ chatId: currentChatId, message: text })
         });
 
         const data = await response.json();
+        if (response.ok && data.chatId) {
+          currentChatId = data.chatId;
+        }
+
         addMessage(response.ok ? data.answer : data.detail || data.error || 'Pozadavek selhal.', 'assistant');
       } catch {
         addMessage('Nepodarilo se zavolat backend aplikace.', 'assistant');
@@ -175,6 +183,16 @@ builder.Services.AddHttpClient("OpenAI", client =>
     client.BaseAddress = new Uri("https://api.openai.com/v1/");
 });
 
+// Registrace EF Core DbContextu pro SQL Server.
+// Connection string je v appsettings.json pod ConnectionStrings:DefaultConnection.
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
+    ?? throw new InvalidOperationException("Chybi connection string DefaultConnection.");
+
+builder.Services.AddDbContext<AppDbContext>(options =>
+{
+    options.UseSqlServer(connectionString);
+});
+
 // Sestaveni aplikace z nakonfigurovanych sluzeb.
 var app = builder.Build();
 
@@ -186,6 +204,7 @@ app.MapPost("/api/chat", async (
     ChatRequest request,
     IConfiguration configuration,
     IHttpClientFactory httpClientFactory,
+    AppDbContext dbContext,
     CancellationToken cancellationToken) =>
 {
     // Zakladni kontrola vstupu, aby se neposilal prazdny prompt.
@@ -211,6 +230,48 @@ app.MapPost("/api/chat", async (
 
     // Model jde prepsat v konfiguraci. Default je jednoduchy a levnejsi model pro MVP.
     var model = configuration["OpenAI:Model"] ?? "gpt-4.1-mini";
+    var now = DateTime.UtcNow;
+
+    // Vytvoreni noveho chatu, pokud frontend jeste neposlal existujici ChatId.
+    var chat = request.ChatId.HasValue
+        ? await dbContext.Chats.FirstOrDefaultAsync(item => item.Id == request.ChatId.Value, cancellationToken)
+        : null;
+
+    if (chat is null)
+    {
+        chat = new Chat
+        {
+            Id = Guid.NewGuid(),
+            Title = CreateChatTitle(request.Message),
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            SourceApp = "MujOpenAiApi",
+            MetadataJson = JsonSerializer.Serialize(new
+            {
+                createdBy = "OpenAI Chat MVP",
+                firstModel = model
+            })
+        };
+
+        dbContext.Chats.Add(chat);
+    }
+
+    // Okamzite ulozeni promptu od uzivatele do databaze.
+    dbContext.ChatMessages.Add(new ChatMessage
+    {
+        Id = Guid.NewGuid(),
+        ChatId = chat.Id,
+        Role = "user",
+        Content = request.Message,
+        CreatedAtUtc = now,
+        MetadataJson = JsonSerializer.Serialize(new
+        {
+            source = "frontend"
+        })
+    });
+
+    chat.UpdatedAtUtc = now;
+    await dbContext.SaveChangesAsync(cancellationToken);
 
     // Payload pro OpenAI Responses API. Vstupem je primo prompt od uzivatele.
     var payload = new
@@ -239,7 +300,28 @@ app.MapPost("/api/chat", async (
 
     // Vytazeni textu odpovedi z JSON struktury a vraceni do frontendu.
     var answer = ExtractText(responseJson);
-    return Results.Ok(new ChatResponse(answer));
+    var answerCreatedAt = DateTime.UtcNow;
+
+    // Okamzite ulozeni odpovedi asistenta do databaze.
+    dbContext.ChatMessages.Add(new ChatMessage
+    {
+        Id = Guid.NewGuid(),
+        ChatId = chat.Id,
+        Role = "assistant",
+        Content = answer,
+        CreatedAtUtc = answerCreatedAt,
+        Model = model,
+        MetadataJson = JsonSerializer.Serialize(new
+        {
+            source = "openai",
+            responseStatusCode = (int)response.StatusCode
+        })
+    });
+
+    chat.UpdatedAtUtc = answerCreatedAt;
+    await dbContext.SaveChangesAsync(cancellationToken);
+
+    return Results.Ok(new ChatResponse(chat.Id, answer));
 });
 
 // Spusteni webove aplikace.
@@ -284,10 +366,19 @@ static string ExtractText(string responseJson)
     return string.IsNullOrWhiteSpace(result) ? "Model nevratil textovou odpoved." : result;
 }
 
+// Pomocna metoda pro jednoduchy nazev chatu podle prvni zpravy.
+static string CreateChatTitle(string message)
+{
+    var normalized = message.Trim().ReplaceLineEndings(" ");
+    return normalized.Length <= 80 ? normalized : $"{normalized[..77]}...";
+}
+
 // Datovy model requestu, ktery posila frontend na backend.
 public sealed record ChatRequest(
+    [property: JsonPropertyName("chatId")] Guid? ChatId,
     [property: JsonPropertyName("message")] string Message);
 
 // Datovy model response, ktery backend vraci frontendu.
 public sealed record ChatResponse(
+    [property: JsonPropertyName("chatId")] Guid ChatId,
     [property: JsonPropertyName("answer")] string Answer);
