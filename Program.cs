@@ -199,6 +199,35 @@ var app = builder.Build();
 // Endpoint pro hlavni stranku s jednoduchym chatovacim frontendem.
 app.MapGet("/", () => Results.Content(IndexHtml, "text/html; charset=utf-8"));
 
+// Endpoint pro nacteni ulozene historie konkretniho chatu z databaze.
+// Pouziva ho napr. SandboxUniversity pri prepinani mezi lekcemi, aby znovu vykreslil chat.
+app.MapGet("/api/chats/{chatId:guid}/messages", async (
+    Guid chatId,
+    AppDbContext dbContext,
+    CancellationToken cancellationToken) =>
+{
+    var chatExists = await dbContext.Chats
+        .AsNoTracking()
+        .AnyAsync(chat => chat.Id == chatId, cancellationToken);
+
+    if (!chatExists)
+    {
+        return Results.NotFound(new { error = "Chat neexistuje." });
+    }
+
+    var messages = await dbContext.ChatMessages
+        .AsNoTracking()
+        .Where(message => message.ChatId == chatId)
+        .OrderBy(message => message.CreatedAtUtc)
+        .Select(message => new ChatMessageResponse(
+            message.Role,
+            message.Content,
+            message.CreatedAtUtc))
+        .ToListAsync(cancellationToken);
+
+    return Results.Ok(messages);
+});
+
 // Endpoint, ktery prijme prompt z frontendu, posle ho do OpenAI API a vrati odpoved.
 app.MapPost("/api/chat", async (
     ChatRequest request,
@@ -284,6 +313,20 @@ app.MapPost("/api/chat", async (
         .OrderBy(message => message.CreatedAtUtc)
         .Select(message => new OpenAiInputMessage(message.Role, message.Content))
         .ToListAsync(cancellationToken);
+
+    if (!string.IsNullOrWhiteSpace(request.ContextTitle) || !string.IsNullOrWhiteSpace(request.ContextContent))
+    {
+        chatHistory.Insert(0, new OpenAiInputMessage("system", $"""
+            Kontext aktualni lekce:
+            Nazev: {request.ContextTitle}
+
+            Obsah lekce:
+            {request.ContextContent}
+
+            Odpovidej primarne v kontextu teto lekce. Pokud se uzivatel pta mimo lekci,
+            upozorni ho a vrat odpoved zpet k tematu lekce.
+            """));
+    }
 
     // Payload pro OpenAI Responses API. Vstupem je historie chatu, ne jen posledni prompt.
     var payload = new
@@ -389,12 +432,20 @@ static string CreateChatTitle(string message)
 // Datovy model requestu, ktery posila frontend na backend.
 public sealed record ChatRequest(
     [property: JsonPropertyName("chatId")] Guid? ChatId,
+    [property: JsonPropertyName("contextTitle")] string? ContextTitle,
+    [property: JsonPropertyName("contextContent")] string? ContextContent,
     [property: JsonPropertyName("message")] string Message);
 
 // Datovy model response, ktery backend vraci frontendu.
 public sealed record ChatResponse(
     [property: JsonPropertyName("chatId")] Guid ChatId,
     [property: JsonPropertyName("answer")] string Answer);
+
+// Datovy model ulozene zpravy vracene klientovi pri obnove historie chatu.
+public sealed record ChatMessageResponse(
+    [property: JsonPropertyName("role")] string Role,
+    [property: JsonPropertyName("content")] string Content,
+    [property: JsonPropertyName("createdAtUtc")] DateTime CreatedAtUtc);
 
 // Datovy model jedne zpravy posilane do OpenAI jako historie konverzace.
 public sealed record OpenAiInputMessage(
