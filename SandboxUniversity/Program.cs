@@ -140,6 +140,23 @@ const string IndexHtml = """
       border-top: 1px solid #d7dee8;
     }
 
+    .agent-actions {
+      display: flex;
+      gap: 8px;
+      padding: 12px 14px 0;
+      border-top: 1px solid #d7dee8;
+    }
+
+    .agent-actions button {
+      border: 1px solid #b8c4d2;
+      border-radius: 6px;
+      background: #ffffff;
+      color: #18212f;
+      padding: 8px 10px;
+      font: inherit;
+      cursor: pointer;
+    }
+
     textarea {
       min-height: 44px;
       max-height: 140px;
@@ -192,6 +209,10 @@ const string IndexHtml = """
     <section class="chat">
       <header id="chat-title">Chat k lekci</header>
       <div id="messages"></div>
+      <div class="agent-actions">
+        <button id="create-test" type="button">Vytvorit test</button>
+        <button id="create-schedule" type="button">Vytvorit rozvrh</button>
+      </div>
       <form id="chat-form">
         <textarea id="message" placeholder="Zeptej se k aktualni lekci..." required></textarea>
         <button id="send" type="submit">Odeslat</button>
@@ -208,6 +229,8 @@ const string IndexHtml = """
     const form = document.getElementById('chat-form');
     const input = document.getElementById('message');
     const send = document.getElementById('send');
+    const createTest = document.getElementById('create-test');
+    const createSchedule = document.getElementById('create-schedule');
 
     let lessons = [];
     let activeLesson = null;
@@ -299,17 +322,43 @@ const string IndexHtml = """
       const text = input.value.trim();
       if (!text || !activeLesson) return;
 
+      await sendChatMessage(text, false, null);
+      input.value = '';
+    });
+
+    // Agentni tlacitko: neodesila volny chat, ale konkretni zadost o vytvoreni testove sady.
+    createTest.addEventListener('click', async () => {
+      if (!activeLesson) return;
+      await sendChatMessage('Vytvor testovou sadu k aktualni lekci.', true, 'create_test_set');
+    });
+
+    // Agentni tlacitko: zadost o vytvoreni jednoducheho rozvrhu/studijniho planu.
+    createSchedule.addEventListener('click', async () => {
+      if (!activeLesson) return;
+      await sendChatMessage('Vytvor rozvrh nebo studijni plan k aktualni lekci.', true, 'create_schedule');
+    });
+
+    // Spolecna odesilaci funkce pro bezny chat i agentni akce.
+    // useAgent rozhoduje, jestli sandbox zavola /chat nebo /agent-chat proxy endpoint.
+    async function sendChatMessage(text, useAgent, requestedAction) {
       addMessage(text, 'user');
       input.value = '';
       send.disabled = true;
+      createTest.disabled = true;
+      createSchedule.disabled = true;
 
       try {
-        const response = await fetch(`/api/lessons/${activeLesson.id}/chat`, {
+        const endpoint = useAgent
+          ? `/api/lessons/${activeLesson.id}/agent-chat`
+          : `/api/lessons/${activeLesson.id}/chat`;
+
+        const response = await fetch(endpoint, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chatId: chatIds[activeLesson.id] || null,
-            message: text
+            message: text,
+            requestedAction: requestedAction
           })
         });
 
@@ -318,6 +367,12 @@ const string IndexHtml = """
           chatIds[activeLesson.id] = data.chatId;
           saveChatIds();
           addMessage(data.answer, 'assistant');
+
+          if (Array.isArray(data.artifacts) && data.artifacts.length > 0) {
+            data.artifacts.forEach(artifact => {
+              addMessage(`Vytvoren artifact: ${artifact.type} - ${artifact.title}`, 'assistant');
+            });
+          }
         } else {
           addMessage(data.detail || data.error || 'Pozadavek selhal.', 'assistant');
         }
@@ -325,9 +380,11 @@ const string IndexHtml = """
         addMessage('Nepodarilo se zavolat SandboxUniversity backend.', 'assistant');
       } finally {
         send.disabled = false;
+        createTest.disabled = false;
+        createSchedule.disabled = false;
         input.focus();
       }
-    });
+    }
 
     loadLessons();
   </script>
@@ -420,6 +477,48 @@ app.MapPost("/api/lessons/{lessonId}/chat", async (
     return Results.Ok(responseJson);
 });
 
+// Proxy endpoint pro agentni akce.
+// Sandbox posle lekci a uzivateluv zamer; MujOpenAiApi rozhodne o tool callu a ulozi artifact.
+app.MapPost("/api/lessons/{lessonId}/agent-chat", async (
+    string lessonId,
+    LessonAgentChatRequest request,
+    IHttpClientFactory httpClientFactory,
+    CancellationToken cancellationToken) =>
+{
+    var lesson = lessons.FirstOrDefault(item => item.Id.Equals(lessonId, StringComparison.OrdinalIgnoreCase));
+    if (lesson is null)
+    {
+        return Results.NotFound(new { error = "Lekce neexistuje." });
+    }
+
+    if (string.IsNullOrWhiteSpace(request.Message))
+    {
+        return Results.BadRequest(new { error = "Zadej zpravu." });
+    }
+
+    var payload = new MujOpenAiAgentChatRequest(
+        request.ChatId,
+        lesson.Id,
+        lesson.Title,
+        lesson.Content,
+        request.Message,
+        request.RequestedAction);
+
+    var httpClient = httpClientFactory.CreateClient("MujOpenAiApi");
+    using var response = await httpClient.PostAsJsonAsync("/api/agent-chat", payload, cancellationToken);
+    var responseJson = await response.Content.ReadFromJsonAsync<MujOpenAiAgentChatResponse>(cancellationToken);
+
+    if (!response.IsSuccessStatusCode || responseJson is null)
+    {
+        var rawResponse = await response.Content.ReadAsStringAsync(cancellationToken);
+        return Results.Problem(
+            $"MujOpenAiApi vratilo chybu {(int)response.StatusCode}: {rawResponse}",
+            statusCode: StatusCodes.Status502BadGateway);
+    }
+
+    return Results.Ok(responseJson);
+});
+
 app.Run();
 
 public sealed record Lesson(
@@ -430,6 +529,11 @@ public sealed record Lesson(
 public sealed record LessonChatRequest(
     [property: JsonPropertyName("chatId")] Guid? ChatId,
     [property: JsonPropertyName("message")] string Message);
+
+public sealed record LessonAgentChatRequest(
+    [property: JsonPropertyName("chatId")] Guid? ChatId,
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("requestedAction")] string? RequestedAction);
 
 public sealed record MujOpenAiChatRequest(
     [property: JsonPropertyName("chatId")] Guid? ChatId,
@@ -445,3 +549,22 @@ public sealed record MujOpenAiChatMessageResponse(
     [property: JsonPropertyName("role")] string Role,
     [property: JsonPropertyName("content")] string Content,
     [property: JsonPropertyName("createdAtUtc")] DateTime CreatedAtUtc);
+
+public sealed record MujOpenAiAgentChatRequest(
+    [property: JsonPropertyName("chatId")] Guid? ChatId,
+    [property: JsonPropertyName("lessonId")] string LessonId,
+    [property: JsonPropertyName("lessonTitle")] string LessonTitle,
+    [property: JsonPropertyName("lessonContent")] string LessonContent,
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("requestedAction")] string? RequestedAction);
+
+public sealed record MujOpenAiAgentChatResponse(
+    [property: JsonPropertyName("chatId")] Guid ChatId,
+    [property: JsonPropertyName("answer")] string Answer,
+    [property: JsonPropertyName("artifacts")] List<MujOpenAiGeneratedArtifactResponse> Artifacts);
+
+public sealed record MujOpenAiGeneratedArtifactResponse(
+    [property: JsonPropertyName("id")] Guid Id,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("contentJson")] string ContentJson);

@@ -380,6 +380,258 @@ app.MapPost("/api/chat", async (
     return Results.Ok(new ChatResponse(chat.Id, answer));
 });
 
+// Agentni endpoint pro akce nad lekci, napr. vytvoreni testove sady nebo rozvrhu.
+// Rozdil proti /api/chat: model dostane seznam nastroju a muze pozadat .NET aplikaci o jejich provedeni.
+app.MapPost("/api/agent-chat", async (
+    AgentChatRequest request,
+    IConfiguration configuration,
+    IHttpClientFactory httpClientFactory,
+    AppDbContext dbContext,
+    CancellationToken cancellationToken) =>
+{
+    if (string.IsNullOrWhiteSpace(request.Message))
+    {
+        return Results.BadRequest(new { error = "Zadej prompt." });
+    }
+
+    var apiKey = configuration["OpenAI:ApiKey"];
+    if (string.IsNullOrWhiteSpace(apiKey))
+    {
+        apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+    }
+
+    if (string.IsNullOrWhiteSpace(apiKey))
+    {
+        return Results.Problem(
+            "Chybi OpenAI API klic. Nastav OPENAI_API_KEY nebo user-secret OpenAI:ApiKey.",
+            statusCode: StatusCodes.Status500InternalServerError);
+    }
+
+    var model = configuration["OpenAI:Model"] ?? "gpt-4.1-mini";
+    var now = DateTime.UtcNow;
+
+    // Agentni chat pouziva stejny Chat/ChatMessages model jako bezny chat.
+    // Diky tomu zustava historie konverzace spolecna pro lekci i agentni akce.
+    var chat = request.ChatId.HasValue
+        ? await dbContext.Chats.FirstOrDefaultAsync(item => item.Id == request.ChatId.Value, cancellationToken)
+        : null;
+
+    if (chat is null)
+    {
+        chat = new Chat
+        {
+            Id = Guid.NewGuid(),
+            Title = string.IsNullOrWhiteSpace(request.LessonTitle)
+                ? CreateChatTitle(request.Message)
+                : request.LessonTitle,
+            CreatedAtUtc = now,
+            UpdatedAtUtc = now,
+            SourceApp = "MujOpenAiApi.Agent",
+            MetadataJson = JsonSerializer.Serialize(new
+            {
+                lessonId = request.LessonId,
+                mode = "agent"
+            })
+        };
+
+        dbContext.Chats.Add(chat);
+    }
+
+    // Ulozeni promptu uzivatele jeste pred volanim OpenAI.
+    dbContext.ChatMessages.Add(new ChatMessage
+    {
+        Id = Guid.NewGuid(),
+        ChatId = chat.Id,
+        Role = "user",
+        Content = request.Message,
+        CreatedAtUtc = now,
+        MetadataJson = JsonSerializer.Serialize(new
+        {
+            source = "sandbox-agent",
+            lessonId = request.LessonId,
+            requestedAction = request.RequestedAction
+        })
+    });
+
+    var agentRun = new AgentRun
+    {
+        Id = Guid.NewGuid(),
+        ChatId = chat.Id,
+        LessonId = request.LessonId,
+        LessonTitle = request.LessonTitle,
+        UserPrompt = request.Message,
+        Status = "Started",
+        CreatedAtUtc = now,
+        MetadataJson = JsonSerializer.Serialize(new
+        {
+            requestedAction = request.RequestedAction,
+            model
+        })
+    };
+
+    dbContext.AgentRuns.Add(agentRun);
+    chat.UpdatedAtUtc = now;
+    await dbContext.SaveChangesAsync(cancellationToken);
+
+    // Historie chatu se znovu nacte po ulozeni user message, aby agent videl i aktualni prompt.
+    var historyMessageLimit = configuration.GetValue("OpenAI:HistoryMessageLimit", 20);
+    var chatHistory = await dbContext.ChatMessages
+        .AsNoTracking()
+        .Where(message => message.ChatId == chat.Id)
+        .OrderByDescending(message => message.CreatedAtUtc)
+        .Take(historyMessageLimit)
+        .OrderBy(message => message.CreatedAtUtc)
+        .Select(message => new OpenAiInputMessage(message.Role, message.Content))
+        .ToListAsync(cancellationToken);
+
+    // Kontext lekce se neposila jako user message do DB; slouzi jen modelu pro aktualni agentni rozhodnuti.
+    chatHistory.Insert(0, new OpenAiInputMessage("system", $"""
+        Kontext aktualni lekce:
+        LessonId: {request.LessonId}
+        Nazev: {request.LessonTitle}
+
+        Obsah lekce:
+        {request.LessonContent}
+        """));
+
+    var tools = CreateAgentTools();
+    var httpClient = httpClientFactory.CreateClient("OpenAI");
+
+    // Prvni volani modelu: model muze odpovedet textem, nebo pozadat o zavolani toolu.
+    var firstPayload = new
+    {
+        model,
+        instructions = """
+            Jsi agentni asistent pro univerzitni lekci.
+            Pokud uzivatel chce vytvorit testovou sadu, pouzij tool save_test_set.
+            Pokud uzivatel chce vytvorit rozvrh nebo studijni plan, pouzij tool save_schedule.
+            Vystupy nastroju vytvarej jako navrhy, ktere uzivatel muze pozdeji schvalit.
+            """,
+        tools,
+        input = chatHistory
+    };
+
+    var firstResponseJson = await SendOpenAiResponseAsync(httpClient, apiKey, firstPayload, cancellationToken);
+    if (!firstResponseJson.IsSuccess)
+    {
+        agentRun.Status = "Failed";
+        agentRun.CompletedAtUtc = DateTime.UtcNow;
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return Results.Problem(
+            $"OpenAI API vratilo chybu {firstResponseJson.StatusCode}: {firstResponseJson.Body}",
+            statusCode: StatusCodes.Status502BadGateway);
+    }
+
+    var functionCalls = ExtractFunctionCalls(firstResponseJson.Body);
+    if (functionCalls.Count == 0)
+    {
+        // Pokud model nepouzije tool, chovame se jako bezny chat a ulozime textovou odpoved.
+        var directAnswer = ExtractText(firstResponseJson.Body);
+        var directAnswerCreatedAt = DateTime.UtcNow;
+
+        dbContext.ChatMessages.Add(new ChatMessage
+        {
+            Id = Guid.NewGuid(),
+            ChatId = chat.Id,
+            Role = "assistant",
+            Content = directAnswer,
+            CreatedAtUtc = directAnswerCreatedAt,
+            Model = model,
+            MetadataJson = JsonSerializer.Serialize(new
+            {
+                source = "openai-agent",
+                agentRunId = agentRun.Id,
+                toolCalls = 0
+            })
+        });
+
+        agentRun.Status = "CompletedWithoutTool";
+        agentRun.CompletedAtUtc = directAnswerCreatedAt;
+        chat.UpdatedAtUtc = directAnswerCreatedAt;
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return Results.Ok(new AgentChatResponse(chat.Id, directAnswer, []));
+    }
+
+    // Provedeni tool callu na serveru. Model nerozhoduje primo o DB, jen posle validovatelne argumenty.
+    var toolOutputs = new List<object>();
+    var artifactResponses = new List<GeneratedArtifactResponse>();
+    foreach (var functionCall in functionCalls)
+    {
+        var toolResult = ExecuteAgentTool(functionCall, request, agentRun.Id, dbContext);
+        toolOutputs.Add(new
+        {
+            type = "function_call_output",
+            call_id = functionCall.CallId,
+            output = toolResult.OutputJson
+        });
+
+        if (toolResult.Artifact is not null)
+        {
+            artifactResponses.Add(new GeneratedArtifactResponse(
+                toolResult.Artifact.Id,
+                toolResult.Artifact.Type,
+                toolResult.Artifact.Title,
+                toolResult.Artifact.ContentJson));
+        }
+    }
+
+    await dbContext.SaveChangesAsync(cancellationToken);
+
+    // Druhe volani modelu: posleme mu puvodni historii, jeho function_call itemy a vystupy nastroju.
+    var finalInput = new List<object>();
+    finalInput.AddRange(chatHistory);
+    finalInput.AddRange(ExtractOutputItems(firstResponseJson.Body).Select(item => (object)item));
+    finalInput.AddRange(toolOutputs);
+
+    var finalPayload = new
+    {
+        model,
+        instructions = "Vrat strucnou finalni odpoved uzivateli a rekni, co bylo vytvoreno.",
+        tools,
+        input = finalInput
+    };
+
+    var finalResponseJson = await SendOpenAiResponseAsync(httpClient, apiKey, finalPayload, cancellationToken);
+    if (!finalResponseJson.IsSuccess)
+    {
+        agentRun.Status = "ToolCompletedFinalResponseFailed";
+        agentRun.CompletedAtUtc = DateTime.UtcNow;
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        return Results.Problem(
+            $"OpenAI API vratilo chybu {finalResponseJson.StatusCode}: {finalResponseJson.Body}",
+            statusCode: StatusCodes.Status502BadGateway);
+    }
+
+    var answer = ExtractText(finalResponseJson.Body);
+    var answerCreatedAt = DateTime.UtcNow;
+
+    dbContext.ChatMessages.Add(new ChatMessage
+    {
+        Id = Guid.NewGuid(),
+        ChatId = chat.Id,
+        Role = "assistant",
+        Content = answer,
+        CreatedAtUtc = answerCreatedAt,
+        Model = model,
+        MetadataJson = JsonSerializer.Serialize(new
+        {
+            source = "openai-agent",
+            agentRunId = agentRun.Id,
+            toolCalls = functionCalls.Count
+        })
+    });
+
+    agentRun.Status = "Completed";
+    agentRun.CompletedAtUtc = answerCreatedAt;
+    chat.UpdatedAtUtc = answerCreatedAt;
+    await dbContext.SaveChangesAsync(cancellationToken);
+
+    return Results.Ok(new AgentChatResponse(chat.Id, answer, artifactResponses));
+});
+
 // Spusteni webove aplikace.
 app.Run();
 
@@ -429,6 +681,233 @@ static string CreateChatTitle(string message)
     return normalized.Length <= 80 ? normalized : $"{normalized[..77]}...";
 }
 
+// Definice agentnich nastroju, ktere muze model zavolat.
+// Tady modelu popisujeme jen schema; skutecne ulozeni do DB dela az nas C# kod.
+static object[] CreateAgentTools()
+{
+    return
+    [
+        new
+        {
+            type = "function",
+            name = "save_test_set",
+            description = "Ulozi navrh testove sady pro aktualni lekci.",
+            parameters = new
+            {
+                type = "object",
+                additionalProperties = false,
+                properties = new
+                {
+                    title = new { type = "string", description = "Nazev testove sady." },
+                    description = new { type = "string", description = "Kratky popis testove sady." },
+                    questions = new
+                    {
+                        type = "array",
+                        description = "Seznam testovych otazek.",
+                        items = new
+                        {
+                            type = "object",
+                            additionalProperties = false,
+                            properties = new
+                            {
+                                question = new { type = "string" },
+                                answer = new { type = "string" },
+                                difficulty = new { type = "string", description = "easy, medium nebo hard" }
+                            },
+                            required = new[] { "question", "answer", "difficulty" }
+                        }
+                    }
+                },
+                required = new[] { "title", "description", "questions" }
+            }
+        },
+        new
+        {
+            type = "function",
+            name = "save_schedule",
+            description = "Ulozi navrh rozvrhu nebo studijniho planu pro aktualni lekci.",
+            parameters = new
+            {
+                type = "object",
+                additionalProperties = false,
+                properties = new
+                {
+                    title = new { type = "string", description = "Nazev rozvrhu." },
+                    description = new { type = "string", description = "Kratky popis rozvrhu." },
+                    items = new
+                    {
+                        type = "array",
+                        description = "Jednotlive casti rozvrhu.",
+                        items = new
+                        {
+                            type = "object",
+                            additionalProperties = false,
+                            properties = new
+                            {
+                                order = new { type = "integer" },
+                                title = new { type = "string" },
+                                durationMinutes = new { type = "integer" },
+                                activity = new { type = "string" }
+                            },
+                            required = new[] { "order", "title", "durationMinutes", "activity" }
+                        }
+                    }
+                },
+                required = new[] { "title", "description", "items" }
+            }
+        }
+    ];
+}
+
+// Spolecna metoda pro volani OpenAI Responses API.
+static async Task<OpenAiHttpResult> SendOpenAiResponseAsync(
+    HttpClient httpClient,
+    string apiKey,
+    object payload,
+    CancellationToken cancellationToken)
+{
+    using var httpRequest = new HttpRequestMessage(HttpMethod.Post, "responses");
+    httpRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+    httpRequest.Content = JsonContent.Create(payload);
+
+    using var response = await httpClient.SendAsync(httpRequest, cancellationToken);
+    var responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
+
+    return new OpenAiHttpResult(response.IsSuccessStatusCode, (int)response.StatusCode, responseJson);
+}
+
+// Vytahne function_call polozky z odpovedi modelu.
+static List<OpenAiFunctionCall> ExtractFunctionCalls(string responseJson)
+{
+    using var document = JsonDocument.Parse(responseJson);
+    if (!document.RootElement.TryGetProperty("output", out var output) || output.ValueKind != JsonValueKind.Array)
+    {
+        return [];
+    }
+
+    var calls = new List<OpenAiFunctionCall>();
+    foreach (var item in output.EnumerateArray())
+    {
+        if (!item.TryGetProperty("type", out var type) || type.GetString() != "function_call")
+        {
+            continue;
+        }
+
+        var callId = item.TryGetProperty("call_id", out var callIdElement) ? callIdElement.GetString() : null;
+        var name = item.TryGetProperty("name", out var nameElement) ? nameElement.GetString() : null;
+        var arguments = item.TryGetProperty("arguments", out var argumentsElement) ? argumentsElement.GetString() : null;
+
+        if (!string.IsNullOrWhiteSpace(callId) && !string.IsNullOrWhiteSpace(name))
+        {
+            calls.Add(new OpenAiFunctionCall(callId, name, arguments ?? "{}"));
+        }
+    }
+
+    return calls;
+}
+
+// Vytahne cele output itemy z odpovedi modelu, aby sly poslat zpet spolu s function_call_output.
+static List<JsonElement> ExtractOutputItems(string responseJson)
+{
+    using var document = JsonDocument.Parse(responseJson);
+    if (!document.RootElement.TryGetProperty("output", out var output) || output.ValueKind != JsonValueKind.Array)
+    {
+        return [];
+    }
+
+    return output.EnumerateArray()
+        .Select(item => item.Clone())
+        .ToList();
+}
+
+// Provedeni agentniho toolu v .NET aplikaci.
+// Model navrhne obsah artifactu, ale az tahle metoda rozhoduje, co se opravdu ulozi do DB.
+static AgentToolExecutionResult ExecuteAgentTool(
+    OpenAiFunctionCall functionCall,
+    AgentChatRequest request,
+    Guid agentRunId,
+    AppDbContext dbContext)
+{
+    var now = DateTime.UtcNow;
+    var artifactType = functionCall.Name switch
+    {
+        "save_test_set" => "TestSet",
+        "save_schedule" => "Schedule",
+        _ => "Unknown"
+    };
+
+    if (artifactType == "Unknown")
+    {
+        var unknownResult = JsonSerializer.Serialize(new
+        {
+            saved = false,
+            error = $"Unknown tool: {functionCall.Name}"
+        });
+
+        dbContext.AgentActions.Add(new AgentAction
+        {
+            Id = Guid.NewGuid(),
+            AgentRunId = agentRunId,
+            ToolName = functionCall.Name,
+            ArgumentsJson = functionCall.ArgumentsJson,
+            ResultJson = unknownResult,
+            CreatedAtUtc = now
+        });
+
+        return new AgentToolExecutionResult(unknownResult, null);
+    }
+
+    var title = TryGetJsonString(functionCall.ArgumentsJson, "title")
+        ?? $"{artifactType} - {request.LessonTitle}";
+
+    var artifact = new GeneratedArtifact
+    {
+        Id = Guid.NewGuid(),
+        AgentRunId = agentRunId,
+        LessonId = request.LessonId,
+        Type = artifactType,
+        Title = title,
+        ContentJson = functionCall.ArgumentsJson,
+        CreatedAtUtc = now
+    };
+
+    var resultJson = JsonSerializer.Serialize(new
+    {
+        saved = true,
+        artifactId = artifact.Id,
+        artifactType = artifact.Type,
+        title = artifact.Title
+    });
+
+    dbContext.GeneratedArtifacts.Add(artifact);
+    dbContext.AgentActions.Add(new AgentAction
+    {
+        Id = Guid.NewGuid(),
+        AgentRunId = agentRunId,
+        ToolName = functionCall.Name,
+        ArgumentsJson = functionCall.ArgumentsJson,
+        ResultJson = resultJson,
+        CreatedAtUtc = now
+    });
+
+    return new AgentToolExecutionResult(resultJson, artifact);
+}
+
+static string? TryGetJsonString(string json, string propertyName)
+{
+    try
+    {
+        using var document = JsonDocument.Parse(json);
+        return document.RootElement.TryGetProperty(propertyName, out var property)
+            ? property.GetString()
+            : null;
+    }
+    catch (JsonException)
+    {
+        return null;
+    }
+}
+
 // Datovy model requestu, ktery posila frontend na backend.
 public sealed record ChatRequest(
     [property: JsonPropertyName("chatId")] Guid? ChatId,
@@ -451,3 +930,36 @@ public sealed record ChatMessageResponse(
 public sealed record OpenAiInputMessage(
     [property: JsonPropertyName("role")] string Role,
     [property: JsonPropertyName("content")] string Content);
+
+public sealed record AgentChatRequest(
+    [property: JsonPropertyName("chatId")] Guid? ChatId,
+    [property: JsonPropertyName("lessonId")] string LessonId,
+    [property: JsonPropertyName("lessonTitle")] string LessonTitle,
+    [property: JsonPropertyName("lessonContent")] string LessonContent,
+    [property: JsonPropertyName("message")] string Message,
+    [property: JsonPropertyName("requestedAction")] string? RequestedAction);
+
+public sealed record AgentChatResponse(
+    [property: JsonPropertyName("chatId")] Guid ChatId,
+    [property: JsonPropertyName("answer")] string Answer,
+    [property: JsonPropertyName("artifacts")] List<GeneratedArtifactResponse> Artifacts);
+
+public sealed record GeneratedArtifactResponse(
+    [property: JsonPropertyName("id")] Guid Id,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("contentJson")] string ContentJson);
+
+public sealed record OpenAiHttpResult(
+    bool IsSuccess,
+    int StatusCode,
+    string Body);
+
+public sealed record OpenAiFunctionCall(
+    string CallId,
+    string Name,
+    string ArgumentsJson);
+
+public sealed record AgentToolExecutionResult(
+    string OutputJson,
+    GeneratedArtifact? Artifact);
