@@ -228,6 +228,42 @@ app.MapGet("/api/chats/{chatId:guid}/messages", async (
     return Results.Ok(messages);
 });
 
+// Endpoint pro nacteni vytvorenych agentnich vystupu, napr. testu a rozvrhu.
+// SandboxUniversity ho pouziva pro MVC views, aby nemusel sahat primo do SQL databaze.
+app.MapGet("/api/artifacts", async (
+    string? lessonId,
+    string? type,
+    AppDbContext dbContext,
+    CancellationToken cancellationToken) =>
+{
+    var query = dbContext.GeneratedArtifacts
+        .AsNoTracking()
+        .AsQueryable();
+
+    if (!string.IsNullOrWhiteSpace(lessonId))
+    {
+        query = query.Where(artifact => artifact.LessonId == lessonId);
+    }
+
+    if (!string.IsNullOrWhiteSpace(type))
+    {
+        query = query.Where(artifact => artifact.Type == type);
+    }
+
+    var artifacts = await query
+        .OrderByDescending(artifact => artifact.CreatedAtUtc)
+        .Select(artifact => new ArtifactResponse(
+            artifact.Id,
+            artifact.LessonId,
+            artifact.Type,
+            artifact.Title,
+            artifact.ContentJson,
+            artifact.CreatedAtUtc))
+        .ToListAsync(cancellationToken);
+
+    return Results.Ok(artifacts);
+});
+
 // Endpoint, ktery prijme prompt z frontendu, posle ho do OpenAI API a vrati odpoved.
 app.MapPost("/api/chat", async (
     ChatRequest request,
@@ -949,6 +985,14 @@ public sealed record GeneratedArtifactResponse(
     [property: JsonPropertyName("type")] string Type,
     [property: JsonPropertyName("title")] string Title,
     [property: JsonPropertyName("contentJson")] string ContentJson);
+
+public sealed record ArtifactResponse(
+    [property: JsonPropertyName("id")] Guid Id,
+    [property: JsonPropertyName("lessonId")] string LessonId,
+    [property: JsonPropertyName("type")] string Type,
+    [property: JsonPropertyName("title")] string Title,
+    [property: JsonPropertyName("contentJson")] string ContentJson,
+    [property: JsonPropertyName("createdAtUtc")] DateTime CreatedAtUtc);
 
 public sealed record OpenAiHttpResult(
     bool IsSuccess,

@@ -73,6 +73,22 @@ const string IndexHtml = """
       background: #0f766e;
     }
 
+    .nav-links {
+      display: grid;
+      gap: 8px;
+      margin-top: 18px;
+      padding-top: 18px;
+      border-top: 1px solid #3a4a63;
+    }
+
+    .nav-links a {
+      color: #ffffff;
+      text-decoration: none;
+      background: #263348;
+      border-radius: 6px;
+      padding: 10px 12px;
+    }
+
     .lesson {
       padding: 28px;
       overflow-y: auto;
@@ -199,6 +215,10 @@ const string IndexHtml = """
     <aside>
       <h1>Sandbox University</h1>
       <div id="lesson-list"></div>
+      <nav class="nav-links">
+        <a href="/Tests">Vytvorene testy</a>
+        <a href="/Schedules">Vytvorene rozvrhy</a>
+      </nav>
     </aside>
 
     <main class="lesson">
@@ -394,6 +414,9 @@ const string IndexHtml = """
 
 var builder = WebApplication.CreateBuilder(args);
 
+// MVC registrace pro jednoduche controllery a Razor views nad vytvorenymi artifacty.
+builder.Services.AddControllersWithViews();
+
 // HTTP klient pro volani hlavni MujOpenAiApi sluzby.
 builder.Services.AddHttpClient("MujOpenAiApi", client =>
 {
@@ -405,6 +428,11 @@ var app = builder.Build();
 
 // Hlavni obrazovka sandbox univerzity.
 app.MapGet("/", () => Results.Content(IndexHtml, "text/html; charset=utf-8"));
+
+// MVC routy pro /Tests a /Schedules views.
+app.MapControllerRoute(
+    name: "default",
+    pattern: "{controller=Tests}/{action=Index}/{id?}");
 
 // Endpoint pro seznam testovacich lekci.
 app.MapGet("/api/lessons", () => Results.Ok(lessons));

@@ -1,0 +1,89 @@
+@model ArtifactIndexViewModel
+
+<!doctype html>
+<html lang="cs">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@Model.Title</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f5f7fa;
+            color: #18212f;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 18px 24px;
+            background: #18212f;
+            color: #ffffff;
+        }
+
+        header a {
+            color: #ffffff;
+            text-decoration: none;
+            background: #0f766e;
+            padding: 8px 12px;
+            border-radius: 6px;
+        }
+
+        main {
+            padding: 24px;
+            display: grid;
+            gap: 16px;
+        }
+
+        article {
+            background: #ffffff;
+            border: 1px solid #d7dee8;
+            border-radius: 8px;
+            padding: 16px;
+        }
+
+        .meta {
+            color: #526070;
+            font-size: 14px;
+            margin-bottom: 12px;
+        }
+
+        pre {
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            background: #edf2f7;
+            border-radius: 6px;
+            padding: 12px;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>@Model.Title</h1>
+        <a href="/">Zpet do univerzity</a>
+    </header>
+    <main>
+        @if (Model.Artifacts.Count == 0)
+        {
+            <article>@Model.EmptyText</article>
+        }
+        else
+        {
+            @foreach (var artifact in Model.Artifacts)
+            {
+                <article>
+                    <h2>@artifact.Title</h2>
+                    <div class="meta">
+                        Lekce: @artifact.LessonId |
+                        Typ: @artifact.Type |
+                        Vytvoreno UTC: @artifact.CreatedAtUtc
+                    </div>
+                    <pre>@artifact.ContentJson</pre>
+                </article>
+            }
+        }
+    </main>
+</body>
+</html>
